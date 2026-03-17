@@ -133,7 +133,7 @@ def _parse_simple_rows(
     if not schema:
         return []
 
-    col_keys = [s["N"] for s in schema]
+    col_keys = [s.get("N", f"col{i}") for i, s in enumerate(schema)]
     col_names = [col_map.get(k, k) for k in col_keys]
     num_cols = len(col_keys)
 
@@ -179,7 +179,7 @@ def _parse_matrix_rows(
     # Resolve sub-header labels from SH → DM1
     sh_labels: list[str] = []
     for sh_entry in sub_headers:
-        for key in sorted(sh_entry.keys()):  # DM1, DM2, …
+        for key in sorted(sh_entry.keys(), key=lambda k: int(k[2:]) if k[2:].isdigit() else 0):  # DM1, DM2, …
             for member in sh_entry[key]:
                 label_key = next(
                     (k for k in member if k not in ("S", "R", "Ø", "X", "I")),
@@ -220,7 +220,7 @@ def _parse_matrix_rows(
         x_entries = row.get("X", [])
         offset = 0
         for xi, x_entry in enumerate(x_entries):
-            actual_idx = x_entry.get("I", xi if xi == 0 and "I" not in x_entries[0] else None)
+            actual_idx = x_entry.get("I", xi)
             if actual_idx is None:
                 actual_idx = offset
             offset = actual_idx + 1

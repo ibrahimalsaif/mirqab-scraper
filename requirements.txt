@@ -1,3 +1,5 @@
 playwright>=1.44
 pandas>=2.2
 openpyxl>=3.1
+supabase>=2.0
+python-dotenv>=1.0

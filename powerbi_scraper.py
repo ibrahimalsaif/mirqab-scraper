@@ -13,9 +13,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
-
-from playwright.sync_api import sync_playwright, Page, Route, Request, Response
+from playwright.sync_api import sync_playwright, Page, Response
 
 import config
 
@@ -81,6 +79,42 @@ def _capture_response(exchanges: list[CapturedExchange], response: Response) -> 
     logger.info("Captured response from %s (status %d)", url, response.status)
 
 
+def _force_click(page: Page, element, index: int) -> bool:
+    """Try multiple strategies to click an element that may not be visible."""
+    try:
+        element.scroll_into_view_if_needed(timeout=3_000)
+    except Exception:
+        pass
+
+    try:
+        element.click(timeout=5_000)
+        return True
+    except Exception:
+        pass
+
+    try:
+        element.click(force=True, timeout=5_000)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.evaluate("el => el.click()", element)
+        return True
+    except Exception:
+        pass
+
+    try:
+        box = element.bounding_box()
+        if box:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def _click_tabs(page: Page) -> None:
     """
     Attempt to click through report tabs/pages to trigger additional data
@@ -101,9 +135,15 @@ def _click_tabs(page: Page) -> None:
             logger.info("Found %d tab(s) using selector '%s'", len(tabs), selector)
             for i, tab in enumerate(tabs):
                 try:
-                    tab.click()
-                    page.wait_for_timeout(config.EXTRA_SETTLE_MS)
-                    logger.info("Clicked tab %d/%d", i + 1, len(tabs))
+                    if _force_click(page, tab, i):
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(config.EXTRA_SETTLE_MS)
+                        logger.info("Clicked tab %d/%d", i + 1, len(tabs))
+                    else:
+                        logger.warning("All click strategies failed for tab %d", i + 1)
                 except Exception as exc:
                     logger.warning("Could not click tab %d: %s", i + 1, exc)
             break  # only use the first selector that finds tabs
@@ -134,35 +174,44 @@ def scrape(
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=config.HEADLESS)
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
+        try:
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
 
-        page.on(
-            "response",
-            lambda resp: _capture_response(result.exchanges, resp),
-        )
+            page.on(
+                "response",
+                lambda resp: _capture_response(result.exchanges, resp),
+            )
 
-        logger.info("Navigating to %s", url)
-        page.goto(url, wait_until="networkidle", timeout=config.PAGE_LOAD_TIMEOUT_MS)
+            logger.info("Navigating to %s", url)
+            try:
+                page.goto(url, wait_until="networkidle", timeout=config.PAGE_LOAD_TIMEOUT_MS)
+            except Exception:
+                # networkidle can hang on dashboards with persistent connections;
+                # fall back to domcontentloaded and wait manually.
+                logger.warning("networkidle timed out — falling back to domcontentloaded")
+                page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT_MS)
+                page.wait_for_timeout(config.EXTRA_SETTLE_MS)
 
-        # Give any lazy-loaded visuals time to fire their requests.
-        page.wait_for_timeout(config.EXTRA_SETTLE_MS)
-        logger.info(
-            "Initial load done — captured %d exchange(s) so far",
-            len(result.exchanges),
-        )
+            # Give any lazy-loaded visuals time to fire their requests.
+            page.wait_for_timeout(config.EXTRA_SETTLE_MS)
+            logger.info(
+                "Initial load done — captured %d exchange(s) so far",
+                len(result.exchanges),
+            )
 
-        if click_through_tabs:
-            _click_tabs(page)
+            if click_through_tabs:
+                _click_tabs(page)
 
-        logger.info("Closing browser — total exchanges captured: %d", len(result.exchanges))
-        browser.close()
+        finally:
+            logger.info("Closing browser — total exchanges captured: %d", len(result.exchanges))
+            browser.close()
 
     return result

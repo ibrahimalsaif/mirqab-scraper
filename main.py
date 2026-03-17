@@ -18,6 +18,7 @@ import config
 from powerbi_scraper import scrape
 from parser import try_parse
 from export import export_all
+from supabase_export import upload_all as supabase_upload_all, truncate_all as supabase_truncate_all
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,18 +102,39 @@ def main() -> None:
         logger.warning("Responses were captured but none contained parseable data.")
         sys.exit(0)
 
-    # ── 3. Export ───────────────────────────────────────────────────
-    paths = export_all(named_datasets)
+    # ── 3. Export to files (local dev only) ─────────────────────────
+    paths: list[str] = []
+    if config.SAVE_FILES:
+        paths = export_all(named_datasets)
+    else:
+        logger.info("File export disabled (SAVE_FILES=false)")
 
-    # ── 4. Summary ──────────────────────────────────────────────────
+    # ── 4. Supabase upload ───────────────────────────────────────────
+    supabase_results: dict = {}
+    if config.SUPABASE_URL and config.SUPABASE_KEY:
+        logger.info("Uploading datasets to Supabase …")
+        supabase_truncate_all(named_datasets)
+        supabase_results = supabase_upload_all(named_datasets)
+    elif not config.SAVE_FILES:
+        logger.error("SUPABASE_URL and SUPABASE_KEY must be set when SAVE_FILES=false.")
+        sys.exit(1)
+    else:
+        logger.info("Supabase credentials not set — skipping upload.")
+
+    # ── 5. Summary ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  SCRAPE SUMMARY")
     print("=" * 60)
     print(f"  Exchanges captured : {len(result.exchanges)}")
     print(f"  Datasets parsed    : {len(named_datasets)}")
-    print(f"  Files written      : {len(paths)}")
-    for p in paths:
-        print(f"    → {p}")
+    if paths:
+        print(f"  Files written      : {len(paths)}")
+        for p in paths:
+            print(f"    → {p}")
+    print(f"  Supabase tables    : {len(supabase_results)}")
+    for tbl, cnt in supabase_results.items():
+        status = f"{cnt} rows" if cnt else "FAILED"
+        print(f"    → {tbl}: {status}")
     print("=" * 60 + "\n")
 
 

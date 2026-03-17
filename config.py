@@ -8,6 +8,9 @@ Public URLs typically look like:
 
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ── Target dashboard ────────────────────────────────────────────────
 DASHBOARD_URL = os.getenv(
     "POWERBI_URL",
@@ -28,6 +31,13 @@ PAGE_LOAD_TIMEOUT_MS = 60_000
 EXTRA_SETTLE_MS = 5_000
 
 # ── Output settings ─────────────────────────────────────────────────
+# Set SAVE_FILES=true to also write CSV/Excel to disk (local dev only).
+# Defaults to false so server deployments only push to Supabase.
+SAVE_FILES = os.getenv("SAVE_FILES", "false").lower() == "true"
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 # Supported: "csv", "excel", or "both"
-EXPORT_FORMAT = "both"
+EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "both")
+
+# ── Supabase settings ────────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key recommended

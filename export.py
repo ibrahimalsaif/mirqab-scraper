@@ -52,6 +52,9 @@ def export_dataset(
         Paths of files written.
     """
     fmt = (fmt or config.EXPORT_FORMAT).lower()
+    if fmt not in ("csv", "excel", "both"):
+        logger.warning("Unknown EXPORT_FORMAT '%s' — defaulting to 'both'", fmt)
+        fmt = "both"
     out_dir = _ensure_output_dir()
     safe_name = _sanitize_filename(name)
 
