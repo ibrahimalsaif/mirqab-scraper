@@ -1,11 +1,6 @@
 """
 Core scraping logic: launch a headless browser, navigate to a public Power BI
 dashboard, and intercept every data-bearing API call the page makes.
-
-Power BI dashboards are single-page apps that fetch data through XHR calls to
-endpoints containing "querydata" or "public/reports".  Each visual on the
-dashboard fires its own request, so a single page typically produces many
-request/response pairs.
 """
 
 from __future__ import annotations
@@ -15,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from playwright.sync_api import sync_playwright, Page, Response
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +47,6 @@ def _try_parse_json(raw: str | bytes | None) -> dict | None:
 
 
 def _capture_response(exchanges: list[CapturedExchange], response: Response) -> None:
-    """Callback attached to the page's 'response' event."""
     url = response.url
     if not _matches_intercept_patterns(url):
         return
@@ -69,40 +63,31 @@ def _capture_response(exchanges: list[CapturedExchange], response: Response) -> 
         logger.debug("Skipping non-JSON response from %s", url)
         return
 
-    exchange = CapturedExchange(
+    exchanges.append(CapturedExchange(
         url=url,
         request_payload=request_payload,
         response_body=response_json,
         status=response.status,
-    )
-    exchanges.append(exchange)
+    ))
     logger.info("Captured response from %s (status %d)", url, response.status)
 
 
 def _force_click(page: Page, element, index: int) -> bool:
-    """Try multiple strategies to click an element that may not be visible."""
     try:
         element.scroll_into_view_if_needed(timeout=3_000)
     except Exception:
         pass
 
-    try:
-        element.click(timeout=5_000)
-        return True
-    except Exception:
-        pass
-
-    try:
-        element.click(force=True, timeout=5_000)
-        return True
-    except Exception:
-        pass
-
-    try:
-        page.evaluate("el => el.click()", element)
-        return True
-    except Exception:
-        pass
+    for strategy in [
+        lambda: element.click(timeout=5_000),
+        lambda: element.click(force=True, timeout=5_000),
+        lambda: page.evaluate("el => el.click()", element),
+    ]:
+        try:
+            strategy()
+            return True
+        except Exception:
+            pass
 
     try:
         box = element.bounding_box()
@@ -116,11 +101,6 @@ def _force_click(page: Page, element, index: int) -> bool:
 
 
 def _click_tabs(page: Page) -> None:
-    """
-    Attempt to click through report tabs/pages to trigger additional data
-    requests.  Power BI renders page tabs inside elements whose
-    ``role="tab"`` attribute or class names hint at navigation.
-    """
     try:
         tab_selectors = [
             'div[role="tab"]',
@@ -146,26 +126,15 @@ def _click_tabs(page: Page) -> None:
                         logger.warning("All click strategies failed for tab %d", i + 1)
                 except Exception as exc:
                     logger.warning("Could not click tab %d: %s", i + 1, exc)
-            break  # only use the first selector that finds tabs
+            break
     except Exception as exc:
         logger.warning("Tab-clicking phase failed: %s", exc)
 
 
-def scrape(
-    url: str | None = None,
-    click_through_tabs: bool = True,
-) -> ScrapeResult:
+def scrape(url: str | None = None, click_through_tabs: bool = True) -> ScrapeResult:
     """
-    Main entry point.  Returns every Power BI data exchange captured while
-    browsing the dashboard.
-
-    Parameters
-    ----------
-    url : str, optional
-        Override for the dashboard URL (defaults to ``config.DASHBOARD_URL``).
-    click_through_tabs : bool
-        If *True*, try to discover and click tabs on the report to capture
-        data from every page.
+    Launch a headless browser, navigate to the Power BI dashboard, and
+    return every data exchange captured.
     """
     url = url or config.DASHBOARD_URL
     result = ScrapeResult()
@@ -184,34 +153,24 @@ def scrape(
                 ),
             )
             page = context.new_page()
-
-            page.on(
-                "response",
-                lambda resp: _capture_response(result.exchanges, resp),
-            )
+            page.on("response", lambda resp: _capture_response(result.exchanges, resp))
 
             logger.info("Navigating to %s", url)
             try:
                 page.goto(url, wait_until="networkidle", timeout=config.PAGE_LOAD_TIMEOUT_MS)
             except Exception:
-                # networkidle can hang on dashboards with persistent connections;
-                # fall back to domcontentloaded and wait manually.
                 logger.warning("networkidle timed out — falling back to domcontentloaded")
                 page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT_MS)
                 page.wait_for_timeout(config.EXTRA_SETTLE_MS)
 
-            # Give any lazy-loaded visuals time to fire their requests.
             page.wait_for_timeout(config.EXTRA_SETTLE_MS)
-            logger.info(
-                "Initial load done — captured %d exchange(s) so far",
-                len(result.exchanges),
-            )
+            logger.info("Initial load done — %d exchange(s) so far", len(result.exchanges))
 
             if click_through_tabs:
                 _click_tabs(page)
 
         finally:
-            logger.info("Closing browser — total exchanges captured: %d", len(result.exchanges))
+            logger.info("Closing browser — total: %d exchange(s)", len(result.exchanges))
             browser.close()
 
     return result

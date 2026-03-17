@@ -1,62 +1,6 @@
 """
 Parse Power BI "querydata" JSON responses into flat row dictionaries.
-
-─── Power BI response anatomy ───────────────────────────────────────
-
-A typical querydata response:
-
-{
-  "results": [{
-    "result": {
-      "data": {
-        "dsr": {
-          "DS": [{                              ← DataShape
-            "N":  "DS0",
-            "PH": [{"DM0": [ ... rows ... ]}],  ← PageHierarchy → DataMembers
-            "SH": [{"DM1": [ ... ]}],            ← SubHeaders (matrix only)
-            "IC": true
-          }]
-        }
-      }
-    }
-  }]
-}
-
-─── Row formats ─────────────────────────────────────────────────────
-
-**Simple (C-based)**  —  most visuals:
-
-  Row 0 (carries the schema):
-    {"S": [{"N":"G0","T":1}, {"N":"M0","T":4}], "C": ["USA", 42]}
-
-  Later rows:
-    {"C": ["UK", 10]}                 ← all values present
-    {"C": [5], "R": 1}               ← R bitmask: bit 0 → col 0 repeats
-    {"C": [1772236800000], "Ø": 6}   ← Ø bitmask: bits 1,2 → those cols null
-    {"C": [], "R": 1, "Ø": 6}       ← combined
-
-  For each column position:
-    1. R bit set  → copy value from previous row
-    2. Ø bit set  → value is None (null)
-    3. otherwise  → pop the next value from the packed "C" array
-
-**Matrix (X-based)**  —  pivot-table visuals:
-
-  Row 0:
-    {"S": [{"N":"G0","T":1}], "G0": "Country A",
-     "X": [{"S":[{"N":"M0","T":4}], "M0": 10}, {"M0": 20}]}
-
-  SH (SubHeaders at DS level) names the cross-tab columns:
-    [{"DM1": [{"S":[{"N":"G1","T":1}], "G1":"Missile"}, {"G1":"UAV"}]}]
-
-  Flattened: {"G0":"Country A", "Missile_M0": 10, "UAV_M0": 20}
-
-─── Column naming ───────────────────────────────────────────────────
-
-G0, G1… are group (dimension) columns; M0, M1… are measures.
-Friendly names come from the request payload's Select array:
-  ["Table.Country", "Sum(Table.Sales)"]  →  G0="Country", M0="Sales"
-─────────────────────────────────────────────────────────────────────
+(No changes from original — no config dependency.)
 """
 
 from __future__ import annotations
@@ -68,25 +12,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# ── helpers: extract friendly names from request payload ───────────
-
 def _friendly_name(select_expr: str) -> str:
-    """
-    'Sum(Table.Column Name)' → 'Column Name'
-    'Table.Column Name'      → 'Column Name'
-    """
     inner = re.sub(r"^[A-Za-z]+\((.+)\)$", r"\1", select_expr)
     parts = inner.rsplit(".", 1)
     return parts[-1].strip() if len(parts) > 1 else inner.strip()
 
 
 def build_column_map(request_payload: dict | None) -> dict[str, str]:
-    """
-    Map internal names (G0, M0, …) to human-readable names extracted from
-    the request payload's ``Select`` array.
-
-    Returns a dict like ``{"G0": "Country", "M0": "Sales", ...}``.
-    """
     mapping: dict[str, str] = {}
     if not request_payload:
         return mapping
@@ -102,8 +34,7 @@ def build_column_map(request_payload: dict | None) -> dict[str, str]:
                 for sel in selects:
                     name = sel.get("Name", "")
                     friendly = _friendly_name(name)
-                    agg_keys = {"Sum", "Avg", "Count", "Min", "Max",
-                                "CountNotNull", "Median"}
+                    agg_keys = {"Sum", "Avg", "Count", "Min", "Max", "CountNotNull", "Median"}
                     is_measure = any(
                         k in sel for k in ("Aggregation", "Measure")
                     ) or name.split("(")[0] in agg_keys
@@ -118,13 +49,7 @@ def build_column_map(request_payload: dict | None) -> dict[str, str]:
     return mapping
 
 
-# ── simple (C-based) parser ────────────────────────────────────────
-
-def _parse_simple_rows(
-    dm0_rows: list[dict],
-    col_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    """Parse DM0 rows that use the C/R/Ø format."""
+def _parse_simple_rows(dm0_rows: list[dict], col_map: dict[str, str]) -> list[dict[str, Any]]:
     if not dm0_rows:
         return []
 
@@ -143,7 +68,7 @@ def _parse_simple_rows(
     for row in dm0_rows:
         cell_values = list(row.get("C", []))
         repeat_mask = row.get("R", 0)
-        null_mask = row.get("\u00d8", 0)  # Ø
+        null_mask = row.get("\u00d8", 0)
 
         current: list[Any] = []
         c_idx = 0
@@ -165,25 +90,20 @@ def _parse_simple_rows(
     return records
 
 
-# ── matrix (X-based) parser ────────────────────────────────────────
-
 def _parse_matrix_rows(
     dm0_rows: list[dict],
     sub_headers: list[dict],
     col_map: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Parse DM0 rows that use the G0/X/SH cross-tab format."""
     if not dm0_rows:
         return []
 
-    # Resolve sub-header labels from SH → DM1
     sh_labels: list[str] = []
     for sh_entry in sub_headers:
-        for key in sorted(sh_entry.keys(), key=lambda k: int(k[2:]) if k[2:].isdigit() else 0):  # DM1, DM2, …
+        for key in sorted(sh_entry.keys(), key=lambda k: int(k[2:]) if k[2:].isdigit() else 0):
             for member in sh_entry[key]:
                 label_key = next(
-                    (k for k in member if k not in ("S", "R", "Ø", "X", "I")),
-                    None,
+                    (k for k in member if k not in ("S", "R", "Ø", "X", "I")), None
                 )
                 if label_key and isinstance(member.get(label_key), str):
                     sh_labels.append(member[label_key])
@@ -193,7 +113,6 @@ def _parse_matrix_rows(
     group_keys = [s["N"] for s in group_schema]
     group_names = [col_map.get(k, k) for k in group_keys]
 
-    # Determine measure keys from the first X entry that has S
     measure_keys: list[str] = []
     for row in dm0_rows:
         for x_entry in row.get("X", []):
@@ -241,7 +160,6 @@ def _parse_matrix_rows(
                     val = None
                 record[col_label] = val
 
-        # Fill any sub-header columns not present in this row's X
         for si, sh_label in enumerate(sh_labels):
             for mk in measure_keys:
                 measure_name = col_map.get(mk, mk)
@@ -254,18 +172,10 @@ def _parse_matrix_rows(
     return records
 
 
-# ── top-level API ──────────────────────────────────────────────────
-
 def parse_response(
     response_json: dict,
     request_payload: dict | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """
-    Parse a full Power BI querydata response.
-
-    Returns a list of datasets (one per DataShape).  Each dataset is a list
-    of dictionaries suitable for conversion to a DataFrame.
-    """
     col_map = build_column_map(request_payload)
     datasets: list[list[dict[str, Any]]] = []
 
@@ -278,31 +188,22 @@ def parse_response(
         )
         for ds in dsr.get("DS", []):
             sub_headers = ds.get("SH", [])
-
             for ph_entry in ds.get("PH", []):
                 dm0 = ph_entry.get("DM0", [])
                 if not dm0:
                     continue
-
-                first_row = dm0[0]
-                is_matrix = "X" in first_row
-
+                is_matrix = "X" in dm0[0]
                 if is_matrix:
                     records = _parse_matrix_rows(dm0, sub_headers, col_map)
                 else:
                     records = _parse_simple_rows(dm0, col_map)
-
                 if records:
                     datasets.append(records)
                     logger.info(
                         "Parsed %d rows × %d cols (%s format)",
-                        len(records),
-                        len(records[0]),
+                        len(records), len(records[0]),
                         "matrix" if is_matrix else "simple",
                     )
-
-    if not datasets:
-        logger.debug("No parseable datasets in response")
 
     return datasets
 
@@ -311,7 +212,6 @@ def try_parse(
     response_json: dict | None,
     request_payload: dict | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Safe wrapper that returns ``[]`` on failure."""
     if response_json is None:
         return []
     try:

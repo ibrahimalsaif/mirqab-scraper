@@ -1,70 +1,144 @@
-# Mirqab — Power BI Public Dashboard Scraper
+# strikes-ingest
 
-Scrapes data from any **public** Power BI dashboard by intercepting the API calls the dashboard makes under the hood, parsing the deeply-nested JSON responses, and exporting clean CSV/Excel files.
+Fetches strike/attack data from 4 ArcGIS GeoJSON endpoints and upserts into Supabase.
 
-## How it works
+| `strike_type` | Source |
+|---|---|
+| `iran`      | IranianAttack2026 |
+| `us_israel` | IDF_US_Strikes_2026 |
+| `missile`   | Reported_Missile_Tests |
+| `uav`       | IRAN_UAV |
 
-1. A headless Chromium browser (via Playwright) loads the dashboard.
-2. Every network response whose URL contains `querydata` or `public/reports` is captured.
-3. The nested Power BI JSON (results → result → data → dsr → DS → PH → DM0) is parsed, handling Power BI's bitmask-based data compression.
-4. Each parsed dataset is exported to `output/` as CSV and/or Excel.
+---
 
-## Setup
+## 1. Create the Supabase table
+
+Open the **SQL Editor** in your Supabase project and run the contents of `schema.sql`.
+
+---
+
+## 2. Configure credentials
+
+Create a `.env` file in this directory (never commit it):
+
+```
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_KEY=your-service-role-or-anon-key
+```
+
+---
+
+## 3. Install dependencies
 
 ```bash
-# 1. Create & activate a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate   # macOS / Linux
-# .venv\Scripts\activate    # Windows
-
-# 2. Install Python dependencies
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# 3. Install Playwright's Chromium browser
-playwright install chromium
 ```
 
-## Configuration
+---
 
-Open `config.py` and set `DASHBOARD_URL` to the public Power BI URL you want to scrape, or pass it as an environment variable:
-
-```bash
-export POWERBI_URL="https://app.powerbi.com/view?r=YOUR_TOKEN_HERE"
-```
-
-Other settings in `config.py`:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `HEADLESS` | `True` | Run browser without a visible window |
-| `PAGE_LOAD_TIMEOUT_MS` | `60000` | Max time to wait for page load |
-| `EXTRA_SETTLE_MS` | `5000` | Extra wait after load for late visuals |
-| `OUTPUT_DIR` | `./output` | Where exported files are saved |
-| `EXPORT_FORMAT` | `"both"` | `"csv"`, `"excel"`, or `"both"` |
-
-## Usage
+## 4. Run manually
 
 ```bash
 python main.py
 ```
 
-Output files land in the `output/` folder.
-
-## Project Structure
+Sample output:
 
 ```
-├── main.py               # Entry point — orchestrates scrape → parse → export
-├── powerbi_scraper.py    # Playwright browser automation & request interception
-├── parser.py             # Parses Power BI's nested JSON into flat rows
-├── export.py             # Exports parsed data to CSV / Excel via pandas
-├── config.py             # Dashboard URL, timing, and output settings
-├── requirements.txt      # Python dependencies
-└── output/               # Generated CSV and Excel files (git-ignored)
+[iran] Fetching https://services-eu1.arcgis.com/...
+  42 features received
+  inserted=40  updated=2  skipped=0
+
+[missile] Fetching https://services-eu1.arcgis.com/...
+  ...
+
+========================================
+SUMMARY  inserted=110  updated=5  skipped=0
+========================================
 ```
 
-## Notes
+---
 
-- Only **public** (unauthenticated) dashboards are supported.
-- Each visual on a Power BI dashboard fires its own API call, so a single page typically yields multiple datasets.
-- Power BI compresses repeated cell values using a bitmask (`"R"` key). The parser handles this automatically by filling forward from the previous row.
-- If the dashboard has multiple tabs/pages, the scraper will attempt to click through them to capture all data.
+## 5. Schedule as a daily cron job
+
+### macOS / Linux — crontab
+
+```bash
+crontab -e
+```
+
+Add (adjust paths to match your setup):
+
+```cron
+# Run strikes-ingest every day at 06:00
+0 6 * * * /path/to/strikes-ingest/.venv/bin/python /path/to/strikes-ingest/main.py >> /path/to/strikes-ingest/cron.log 2>&1
+```
+
+### macOS — launchd (recommended over crontab on macOS)
+
+Create `~/Library/LaunchAgents/com.mirqab.strikes-ingest.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mirqab.strikes-ingest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/strikes-ingest/.venv/bin/python</string>
+    <string>/path/to/strikes-ingest/main.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>   <integer>6</integer>
+    <key>Minute</key> <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/path/to/strikes-ingest/cron.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/strikes-ingest/cron.log</string>
+</dict>
+</plist>
+```
+
+Load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.mirqab.strikes-ingest.plist
+```
+
+### Linux — systemd timer
+
+`/etc/systemd/system/strikes-ingest.service`:
+```ini
+[Unit]
+Description=Strikes ingest
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/strikes-ingest
+ExecStart=/path/to/strikes-ingest/.venv/bin/python main.py
+EnvironmentFile=/path/to/strikes-ingest/.env
+```
+
+`/etc/systemd/system/strikes-ingest.timer`:
+```ini
+[Unit]
+Description=Run strikes-ingest daily
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl enable --now strikes-ingest.timer
+```

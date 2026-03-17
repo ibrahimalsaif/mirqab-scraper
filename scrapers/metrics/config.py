@@ -1,14 +1,10 @@
 """
 Configuration for the Power BI dashboard scraper.
-
-Set DASHBOARD_URL to the public Power BI report URL you want to scrape.
-Public URLs typically look like:
-  https://app.powerbi.com/view?r=<encoded_token>
 """
 
 import os
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ── Target dashboard ────────────────────────────────────────────────
@@ -18,7 +14,6 @@ DASHBOARD_URL = os.getenv(
 )
 
 # ── Network interception filters ────────────────────────────────────
-# Substrings that identify Power BI data API calls worth capturing.
 INTERCEPT_PATTERNS = [
     "querydata",
     "public/reports",
@@ -27,17 +22,13 @@ INTERCEPT_PATTERNS = [
 # ── Browser / timing settings ───────────────────────────────────────
 HEADLESS = True
 PAGE_LOAD_TIMEOUT_MS = 60_000
-# Extra wait (ms) after load to let late-firing visuals settle.
 EXTRA_SETTLE_MS = 5_000
 
 # ── Output settings ─────────────────────────────────────────────────
-# Set SAVE_FILES=true to also write CSV/Excel to disk (local dev only).
-# Defaults to false so server deployments only push to Supabase.
 SAVE_FILES = os.getenv("SAVE_FILES", "false").lower() == "true"
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-# Supported: "csv", "excel", or "both"
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "output")
 EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "both")
 
 # ── Supabase settings ────────────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key recommended
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
