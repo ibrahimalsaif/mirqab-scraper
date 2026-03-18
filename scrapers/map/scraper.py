@@ -1,8 +1,8 @@
 """
-scrapers/arcgis.py
+scrapers/map/scraper.py
 
-Fetches strike/attack data from 4 ArcGIS GeoJSON endpoints and upserts
-into the Supabase `strikes` table.
+Fetches strike/attack data from the Flourish story embed (story 3606069)
+and upserts into the Supabase `strikes` table.
 
 Public API
 ----------
@@ -13,133 +13,167 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
-from datetime import datetime
 from typing import Optional
-
-import requests
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-ENDPOINTS = [
-    {
-        "strike_type": "iran",
-        "url": (
-            "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
-            "/IranianAttack2026/FeatureServer/0/query"
-            "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
-        ),
-    },
-    {
-        "strike_type": "missile",
-        "url": (
-            "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
-            "/Reported_Missile_Tests/FeatureServer/0/query"
-            "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
-        ),
-    },
-    {
-        "strike_type": "uav",
-        "url": (
-            "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
-            "/IRAN_UAV/FeatureServer/0/query"
-            "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
-        ),
-    },
-    {
-        "strike_type": "us_israel",
-        "url": (
-            "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
-            "/IDF_US_Strikes_2026/FeatureServer/0/query"
-            "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
-        ),
-    },
-]
-
-DATE_FORMATS = [
-    "%Y-%m-%d",      # "2026-02-28"
-    "%d-%b-%y",      # "21-Jul-25"
-    "%d %B %Y",      # "27 January 2026"
-    "%B %d, %Y",     # "January 27, 2026"
-    "%d/%m/%Y",      # "27/01/2026"
-]
-
-REQUEST_TIMEOUT = 30
-
+FLOURISH_URL = "https://flo.uri.sh/story/3606069/embed"
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Flourish scraper
 # ---------------------------------------------------------------------------
 
-def _parse_date(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    raw = raw.strip()
-    for fmt in DATE_FORMATS:
+def _scrape_flourish() -> list[dict]:
+    """Launch a headless browser, extract points data from Flourish template frame."""
+    from playwright.sync_api import sync_playwright
+
+    points = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
         try:
-            return datetime.strptime(raw, fmt).date().isoformat()
+            page = browser.new_page()
+            logger.info("Navigating to %s", FLOURISH_URL)
+            page.goto(FLOURISH_URL, wait_until="networkidle", timeout=60_000)
+            page.wait_for_timeout(5_000)
+
+            template_frame = next(
+                (f for f in page.frames if "template" in f.url), None
+            )
+            if not template_frame:
+                logger.error("Could not find Flourish template frame")
+                return []
+
+            raw = template_frame.evaluate(
+                "() => JSON.stringify(window.template?.data?.points)"
+            )
+            col_names_raw = template_frame.evaluate(
+                "() => JSON.stringify(window.template?.data?.points?.column_names)"
+            )
+
+            if not raw:
+                logger.error("No points data found in Flourish template")
+                return []
+
+            points = json.loads(raw)
+            col_names = json.loads(col_names_raw) if col_names_raw else {}
+            logger.info("Extracted %d points from Flourish", len(points))
+
+            # Store column names for normalization
+            points = _normalize_points(points, col_names)
+
+        finally:
+            browser.close()
+
+    return points
+
+
+def _parse_date_col(date_str: str) -> Optional[str]:
+    """Parse Flourish date column names to 'YYYY-MM-DD'.
+
+    Handles:
+      '28 Feb'          → '2026-02-28'
+      '1 Mar'           → '2026-03-01'
+      '28 Feb - 17 Mar' → '2026-02-28'  (use range start)
+      'Feb 28'          → '2026-02-28'  (fallback)
+      '2026-03-01'      → '2026-03-01'  (already ISO)
+    """
+    from datetime import datetime
+    if not date_str:
+        return None
+    s = date_str.strip()
+    # Skip date ranges (e.g. "28 Feb - 17 Mar") — these are cumulative totals, not single dates
+    if " - " in s:
+        return None
+    # Try day-first formats (Flourish default)
+    for fmt in ["%d %b", "%d %B", "%d %b %Y", "%d %B %Y"]:
+        try:
+            dt = datetime.strptime(s, fmt)
+            year = dt.year if dt.year != 1900 else 2026
+            return f"{year}-{dt.month:02d}-{dt.day:02d}"
         except ValueError:
             continue
+    # Fallback: month-first formats
+    for fmt in ["%b %d", "%B %d", "%b %d, %Y", "%B %d, %Y"]:
+        try:
+            dt = datetime.strptime(s, fmt)
+            year = dt.year if dt.year != 1900 else 2026
+            return f"{year}-{dt.month:02d}-{dt.day:02d}"
+        except ValueError:
+            continue
+    # Already ISO
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except ValueError:
+        pass
+    logger.warning("Could not parse date column: %r", date_str)
     return None
 
 
-def _coords(feature: dict) -> tuple[Optional[float], Optional[float]]:
-    geom = feature.get("geometry") or {}
-    props = feature.get("properties") or {}
+def _normalize_points(raw_points: list[dict], col_names: dict) -> list[dict]:
+    """Expand each Flourish point into one row per date, matching the strikes table schema."""
+    metadata_cols: list[str] = col_names.get("metadata", [])
+    value_cols: list[str] = col_names.get("value", [])
 
-    if geom.get("type") == "Point":
-        coords = geom.get("coordinates", [])
-        if len(coords) >= 2:
-            return float(coords[1]), float(coords[0])  # GeoJSON is [lon, lat]
+    rows = []
+    for pt in raw_points:
+        lat = pt.get("lat")
+        lon = pt.get("lon")
+        strike_type = pt.get("color", "")
+        metadata: list = pt.get("metadata", [])
+        value: list = pt.get("value", [])
 
-    lat = props.get("latitude") or props.get("Latitude")
-    lon = props.get("longitude") or props.get("Longitude")
-    if lat is not None and lon is not None:
-        return float(lat), float(lon)
+        if lat is None or lon is None:
+            continue
 
-    return None, None
+        # Map metadata list → dict using column names
+        meta_dict = {}
+        for i, col in enumerate(metadata_cols):
+            meta_dict[col] = metadata[i] if i < len(metadata) else None
 
+        # Normalize strike type
+        if "iran" in strike_type.lower():
+            stype = "iran"
+        elif "us" in strike_type.lower() or "israel" in strike_type.lower():
+            stype = "us_israel"
+        else:
+            stype = strike_type.lower().replace(" ", "_")
 
-def _normalize(feature: dict, strike_type: str) -> Optional[dict]:
-    props = feature.get("properties") or {}
+        # Expand into one row per date (value_cols are date labels)
+        for i, date_col in enumerate(value_cols):
+            count = value[i] if i < len(value) else None
+            if not count:
+                continue  # skip zero or null counts
 
-    lat, lon = _coords(feature)
-    if lat is None or lon is None:
-        return None
+            event_date = _parse_date_col(date_col)
+            if not event_date:
+                continue
 
-    raw_date = props.get("Date") or props.get("LastReport") or props.get("date")
-    event_date = _parse_date(raw_date)
+            country = meta_dict.get("Country") or None
+            rows.append({
+                "strike_type": stype,
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "location": meta_dict.get("Location"),
+                "country": country,
+                "event_date": event_date,
+                "total": int(count) if isinstance(count, float) and count.is_integer() else count,
+                "properties": {**meta_dict, "date_label": date_col},
+            })
 
-    location = (
-        props.get("TargeteSite")
-        or props.get("TargetedSite")
-        or props.get("Location")
-        or props.get("System")
-        or props.get("Event")
-    )
+    # Deduplicate by (strike_type, lat, lon, event_date) — sum totals on collision
+    seen: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row["strike_type"], row["latitude"], row["longitude"], row["event_date"])
+        if key in seen:
+            seen[key]["total"] = (seen[key]["total"] or 0) + (row["total"] or 0)
+        else:
+            seen[key] = row
 
-    country = props.get("Country") or props.get("country")
-
-    return {
-        "strike_type": strike_type,
-        "latitude": lat,
-        "longitude": lon,
-        "location": location,
-        "country": country,
-        "event_date": event_date,
-        "total": 1,
-        "properties": {k: v for k, v in props.items() if k != "OBJECTID"},
-    }
-
-
-def _fetch(url: str) -> list[dict]:
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.json().get("features") or []
+    return list(seen.values())
 
 
 def _upsert(client, rows: list[dict]) -> tuple[int, int]:
@@ -148,21 +182,16 @@ def _upsert(client, rows: list[dict]) -> tuple[int, int]:
 
     strike_types = {r["strike_type"] for r in rows}
     already_present: set[tuple] = set()
+
     for st in strike_types:
-        dates = [r["event_date"] for r in rows if r["strike_type"] == st and r["event_date"]]
-        if not dates:
-            continue
         result = (
             client.table("strikes")
             .select("strike_type, latitude, longitude, event_date")
             .eq("strike_type", st)
-            .in_("event_date", dates)
             .execute()
         )
         for rec in result.data:
-            already_present.add(
-                (rec["strike_type"], rec["latitude"], rec["longitude"], rec["event_date"])
-            )
+            already_present.add((rec["strike_type"], rec["latitude"], rec["longitude"], rec["event_date"]))
 
     client.table("strikes").upsert(
         rows,
@@ -170,11 +199,8 @@ def _upsert(client, rows: list[dict]) -> tuple[int, int]:
         ignore_duplicates=False,
     ).execute()
 
-    inserted, updated = 0, 0
+    inserted = updated = 0
     for row in rows:
-        if row["event_date"] is None:
-            inserted += 1
-            continue
         key = (row["strike_type"], row["latitude"], row["longitude"], row["event_date"])
         if key in already_present:
             updated += 1
@@ -189,9 +215,8 @@ def _upsert(client, rows: list[dict]) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 def run(dry_run: bool = False) -> None:
-    """Fetch all ArcGIS endpoints and upsert into Supabase (or print JSON if dry_run)."""
+    """Fetch Flourish map data and upsert into Supabase (or print JSON if dry_run)."""
     if not dry_run:
-        import os
         from supabase import create_client
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
@@ -200,56 +225,126 @@ def run(dry_run: bool = False) -> None:
             sys.exit(1)
         client = create_client(url, key)
 
-    all_rows: dict[str, list[dict]] = {}
-    total_inserted = total_updated = total_skipped = 0
-
-    for endpoint in ENDPOINTS:
-        strike_type = endpoint["strike_type"]
-        url = endpoint["url"]
-
-        logger.info("[%s] Fetching ...", strike_type)
-        try:
-            features = _fetch(url)
-        except requests.RequestException as exc:
-            logger.error("[%s] Fetch failed: %s", strike_type, exc)
-            continue
-
-        logger.info("[%s] %d features received", strike_type, len(features))
-
-        rows, skipped = [], 0
-        for feature in features:
-            row = _normalize(feature, strike_type)
-            if row is None:
-                skipped += 1
-            else:
-                rows.append(row)
-
-        if skipped:
-            logger.info("[%s] %d features skipped (no coordinates)", strike_type, skipped)
-
-        if not rows:
-            total_skipped += skipped
-            continue
-
-        if dry_run:
-            all_rows[strike_type] = rows
-            total_skipped += skipped
-            logger.info("[%s] %d rows normalized (dry run)", strike_type, len(rows))
-        else:
-            try:
-                inserted, updated = _upsert(client, rows)
-            except Exception as exc:
-                logger.error("[%s] Upsert failed: %s", strike_type, exc)
-                total_skipped += len(rows) + skipped
-                continue
-
-            logger.info("[%s] inserted=%d updated=%d skipped=%d", strike_type, inserted, updated, skipped)
-            total_inserted += inserted
-            total_updated += updated
-            total_skipped += skipped
+    rows = _scrape_flourish()
+    if not rows:
+        logger.warning("No rows extracted from Flourish")
+        return
 
     if dry_run:
-        print(json.dumps(all_rows, indent=2, default=str))
-    else:
-        logger.info("SUMMARY  inserted=%d  updated=%d  skipped=%d",
-                    total_inserted, total_updated, total_skipped)
+        print(json.dumps(rows, indent=2, default=str))
+        return
+
+    try:
+        inserted, updated = _upsert(client, rows)
+        logger.info("SUMMARY  inserted=%d  updated=%d  total=%d",
+                    inserted, updated, len(rows))
+    except Exception as exc:
+        logger.error("Upsert failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# OLD ArcGIS scraper (commented out — kept for reference)
+# ---------------------------------------------------------------------------
+
+# import requests
+#
+# ENDPOINTS = [
+#     {
+#         "strike_type": "iran",
+#         "url": (
+#             "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
+#             "/IranianAttack2026/FeatureServer/0/query"
+#             "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+#         ),
+#     },
+#     {
+#         "strike_type": "missile",
+#         "url": (
+#             "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
+#             "/Reported_Missile_Tests/FeatureServer/0/query"
+#             "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+#         ),
+#     },
+#     {
+#         "strike_type": "uav",
+#         "url": (
+#             "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
+#             "/IRAN_UAV/FeatureServer/0/query"
+#             "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+#         ),
+#     },
+#     {
+#         "strike_type": "us_israel",
+#         "url": (
+#             "https://services-eu1.arcgis.com/cOhMqNf3ihcdtO7J/arcgis/rest/services"
+#             "/IDF_US_Strikes_2026/FeatureServer/0/query"
+#             "?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+#         ),
+#     },
+# ]
+#
+# DATE_FORMATS = [
+#     "%Y-%m-%d",
+#     "%d-%b-%y",
+#     "%d %B %Y",
+#     "%B %d, %Y",
+#     "%d/%m/%Y",
+# ]
+#
+# REQUEST_TIMEOUT = 30
+#
+# def _parse_date(raw):
+#     if not raw:
+#         return None
+#     raw = raw.strip()
+#     for fmt in DATE_FORMATS:
+#         try:
+#             return datetime.strptime(raw, fmt).date().isoformat()
+#         except ValueError:
+#             continue
+#     return None
+#
+# def _coords(feature):
+#     geom = feature.get("geometry") or {}
+#     props = feature.get("properties") or {}
+#     if geom.get("type") == "Point":
+#         coords = geom.get("coordinates", [])
+#         if len(coords) >= 2:
+#             return float(coords[1]), float(coords[0])
+#     lat = props.get("latitude") or props.get("Latitude")
+#     lon = props.get("longitude") or props.get("Longitude")
+#     if lat is not None and lon is not None:
+#         return float(lat), float(lon)
+#     return None, None
+#
+# def _normalize_arcgis(feature, strike_type):
+#     props = feature.get("properties") or {}
+#     lat, lon = _coords(feature)
+#     if lat is None or lon is None:
+#         return None
+#     raw_date = props.get("Date") or props.get("LastReport") or props.get("date")
+#     event_date = _parse_date(raw_date)
+#     location = (
+#         props.get("TargeteSite") or props.get("TargetedSite")
+#         or props.get("Location") or props.get("System") or props.get("Event")
+#     )
+#     country = props.get("Country") or props.get("country")
+#     return {
+#         "strike_type": strike_type,
+#         "latitude": lat,
+#         "longitude": lon,
+#         "location": location,
+#         "country": country,
+#         "event_date": event_date,
+#         "total": 1,
+#         "properties": {k: v for k, v in props.items() if k != "OBJECTID"},
+#     }
+#
+# def _fetch_arcgis(url):
+#     response = requests.get(url, timeout=REQUEST_TIMEOUT)
+#     response.raise_for_status()
+#     return response.json().get("features") or []
+#
+# def run_arcgis(dry_run=False):
+#     """Original ArcGIS runner."""
+#     ...
