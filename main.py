@@ -2,10 +2,12 @@
 main.py — Mirqab scraper orchestrator
 
 Usage:
-    python main.py map              # fetch ArcGIS endpoints → Supabase strikes table
+    python main.py map              # fetch Flourish map → Supabase strikes table
     python main.py map --dry-run    # fetch & print JSON, no Supabase needed
     python main.py metrics          # scrape Power BI dashboard → Supabase tables
-    python main.py all              # run both
+    python main.py acled            # fetch ACLED data → Supabase acled_events table
+    python main.py acled --dry-run  # fetch & preview first 5 rows
+    python main.py all              # run all three
 
 Environment variables (set in .env):
     SUPABASE_URL=
@@ -33,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-VALID_COMMANDS = ("map", "metrics", "all")
+VALID_COMMANDS = ("map", "metrics", "acled", "all")
 
 
 def _usage() -> None:
@@ -48,6 +50,16 @@ def _usage() -> None:
 def run_map(dry_run: bool = False) -> None:
     from scrapers.map.scraper import run
     logger.info("=== Map ingest %s===", "(dry run) " if dry_run else "")
+    run(dry_run=dry_run)
+
+
+# ---------------------------------------------------------------------------
+# ACLED runner (Datawrapper)
+# ---------------------------------------------------------------------------
+
+def run_acled(dry_run: bool = False) -> None:
+    from scrapers.acled.scraper import run
+    logger.info("=== ACLED ingest %s===", "(dry run) " if dry_run else "")
     run(dry_run=dry_run)
 
 
@@ -181,6 +193,9 @@ def main() -> None:
 
     if command in ("metrics", "all"):
         run_metrics()
+
+    if command in ("acled", "all"):
+        run_acled(dry_run=dry_run)
 
 
 if __name__ == "__main__":
